@@ -92,14 +92,15 @@ from fastapi import FastAPI, Depends, HTTPException
 #     return {"error": "게시글 없음"}
 
 # main.py 전체 교체
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, relationship
+from sqlalchemy import ForeignKey, UniqueConstraint
 
 from models import Post, User
 
 import models
 import schemas
 
-from database import engine
+from database import Base, engine
 from database import SessionLocal
 
 # password hashing 유틸 추가
@@ -110,11 +111,9 @@ from jose import JWTError, jwt
 from datetime import datetime, timedelta
 
 # 로그인 사용자 인증(Authentication)
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from fastapi import status
 from jose import JWTError, jwt
-
-
 
 app = FastAPI()
 
@@ -156,14 +155,36 @@ def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
 # 게시글 목록 조회
-@app.get("/posts")
+@app.get(
+    "/posts",
+    response_model=list[schemas.PostResponse]
+)
 def get_posts(db: Session = Depends(get_db)):
-
-#   db: Session = SessionLocal()
 
     posts = db.query(models.Post).all()
 
-    return posts
+    result = []
+
+    for post in posts:
+        result.append({
+            "id": post.id,
+            "title": post.title,
+            "content": post.content,
+
+            "owner_id": post.owner_id,
+
+            "author": {
+                "id": post.owner.id,
+                "username": post.owner.username
+            },
+
+            "created_at": post.created_at,
+            "updated_at": post.updated_at,
+
+            "likes_count": len(post.likes)
+        })
+
+    return result
 
 
 # 게시글 상세 조회
@@ -186,16 +207,42 @@ def get_post(post_id: int, db: Session = Depends(get_db)):
 
     return post
 
+# 현재 사용자 가져오기 함수
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="인증할 수 없습니다",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+
+        username: str = payload.get("sub")
+
+        if username is None:
+            raise credentials_exception
+
+    except JWTError:
+        raise credentials_exception
+
+    user = db.query(User).filter(User.username == username).first()
+
+    if user is None:
+        raise credentials_exception
+
+    return user
+
 # 게시글 생성
 @app.post("/posts")
-def create_post(post: schemas.PostCreate, db: Session = Depends(get_db)):
+def create_post(post: schemas.PostCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     
 #   db: Session = SessionLocal()
 
     new_post = models.Post(
         title=post.title,
-        content= post.content,
-        author=post.author
+        content=post.content,
+        owner_id=current_user.id
     )
 
     db.add(new_post)
@@ -207,7 +254,11 @@ def create_post(post: schemas.PostCreate, db: Session = Depends(get_db)):
 
 # 게시글 삭제
 @app.delete("/posts/{post_id}")
-def delete_post(post_id: int, db: Session = Depends(get_db)):
+def delete_post(
+    post_id: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
 
 #   db: Session = SessionLocal()
 
@@ -216,19 +267,32 @@ def delete_post(post_id: int, db: Session = Depends(get_db)):
         .first()
 
     if post is None:
-        return {"error": "게시글 없음"}
+        raise HTTPException(
+            status_code=404,
+            detail="게시글 없음"
+        )
+
+    if post.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="삭제 권한 없음"
+        )
 
     db.delete(post)
-
     db.commit()
 
     return {
-        "message": "삭제 완료"
+        "message": "게시글 삭제 완료"
     }
 
 # 게시글 수정
 @app.put("/posts/{post_id}")
-def update_post(post_id: int, updated_post: schemas.PostUpdate, db: Session = Depends(get_db)):
+def update_post(
+    post_id: int,
+    updated_post: schemas.PostCreate,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
 
 #   db: Session = SessionLocal()
 
@@ -237,20 +301,25 @@ def update_post(post_id: int, updated_post: schemas.PostUpdate, db: Session = De
         .first()
 
     if post is None:
-        return {"error": "게시글 없음"}
+        raise HTTPException(
+            status_code=404,
+            detail="게시글 없음"
+        )
+    
+    if post.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="수정 권한 없음"
+        )
 
     post.title = updated_post.title
     post.content = updated_post.content
-    post.author = updated_post.author
+#    post.author = updated_post.author
 
     db.commit()
-
     db.refresh(post)
 
-    return {
-        "message": "수정 완료",
-        "post": post
-    }
+    return post
 
 # 의존성 주입(Depends)
 
@@ -302,43 +371,22 @@ def create_access_token(data: dict):
 
     return encoded_jwt
 
-# 현재 사용자 가져오기 함수
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="인증할 수 없습니다",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
 
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-
-        username: str = payload.get("sub")
-
-        if username is None:
-            raise credentials_exception
-
-    except JWTError:
-        raise credentials_exception
-
-    user = db.query(User).filter(User.username == username).first()
-
-    if user is None:
-        raise credentials_exception
-
-    return user
 
 # 로그인 API 추가
 @app.post("/login")
-def login(user: schemas.UserLogin, db: Session = Depends(get_db)):
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
     db_user = db.query(models.User)\
-        .filter(models.User.username == user.username)\
+        .filter(models.User.username == form_data.username)\
         .first()
     
     if db_user is None:
         raise HTTPException(status_code=401, detail="사용자 없음")
     
-    valid_pw = verify_password(user.password, db_user.hashed_password)
+    valid_pw = verify_password(form_data.password, db_user.hashed_password)
 
     if not valid_pw:
         raise HTTPException(status_code=401, detail="비밀번호 틀림")
@@ -359,6 +407,14 @@ def login(user: schemas.UserLogin, db: Session = Depends(get_db)):
 def get_users(db: Session = Depends(get_db)):
     users = db.query(models.User).all()
     return users
+
+
+# 실제로 인증이 되는지 확인
+@app.get("/users/me")
+def read_users_me(
+    current_user = Depends(get_current_user)
+):
+    return current_user
 
 # 특정 유저 조회
 @app.get("/users/{user_id}", response_model=schemas.UserResponse)
@@ -410,7 +466,152 @@ def update_user(user_id: int, updated_user: schemas.UserUpdate, db: Session = De
 
     return user
 
+
 # 보호된 API 만들기
 @app.get("/me")
 def read_users_me(current_user: User = Depends(get_current_user)):
     return current_user
+
+# 좋아요 API
+@app.post("/posts/{post_id}/like")
+def like_post(
+    post_id: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    post = db.query(models.Post)\
+        .filter(models.Post.id == post_id)\
+        .first()
+
+    if post is None:
+        raise HTTPException(
+            status_code=404,
+            detail="게시글 없음"
+        )
+
+    existing_like = db.query(models.Like)\
+        .filter(
+            models.Like.user_id == current_user.id,
+            models.Like.post_id == post_id
+        )\
+        .first()
+
+    if existing_like:
+        raise HTTPException(
+            status_code=400,
+            detail="이미 좋아요를 눌렀습니다"
+        )
+
+    like = models.Like(
+        user_id=current_user.id,
+        post_id=post_id
+    )
+
+    db.add(like)
+    db.commit()
+
+    return {
+        "message": "좋아요 완료"
+    }
+
+# 댓글 작성 API
+@app.post(
+    "/posts/{post_id}/comments",
+    response_model=schemas.CommentResponse
+)
+def create_comment(
+    post_id: int,
+    comment: schemas.CommentCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+
+    post = db.query(models.Post)\
+        .filter(models.Post.id == post_id)\
+        .first()
+
+    if post is None:
+        raise HTTPException(
+            status_code=404,
+            detail="게시글 없음"
+        )
+
+    new_comment = models.Comment(
+        content=comment.content,
+        post_id=post_id,
+        owner_id=current_user.id
+    )
+
+    db.add(new_comment)
+    db.commit()
+    db.refresh(new_comment)
+
+    return new_comment
+
+# 댓글 목록 조회
+@app.get(
+    "/posts/{post_id}/comments",
+    response_model=list[schemas.CommentResponse]
+)
+def get_comments(
+    post_id: int,
+    db: Session = Depends(get_db)
+):
+
+    return db.query(models.Comment)\
+        .filter(models.Comment.post_id == post_id)\
+        .all()
+
+# 댓글 수정
+@app.put(
+    "/comments/{comment_id}",
+    response_model=schemas.CommentResponse
+)
+def update_comment(
+    comment_id: int,
+    updated: schemas.CommentCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+
+    comment = db.query(models.Comment)\
+        .filter(models.Comment.id == comment_id)\
+        .first()
+
+    if comment is None:
+        raise HTTPException(404, "댓글 없음")
+
+    if comment.owner_id != current_user.id:
+        raise HTTPException(403, "수정 권한 없음")
+
+    comment.content = updated.content
+    db.commit()
+    db.refresh(comment)
+
+    return comment
+
+# 댓글 삭제
+@app.delete("/comments/{comment_id}")
+def delete_comment(
+    comment_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+
+    comment = db.query(models.Comment)\
+        .filter(models.Comment.id == comment_id)\
+        .first()
+
+    if comment is None:
+        raise HTTPException(404, "댓글 없음")
+
+    if comment.owner_id != current_user.id:
+        raise HTTPException(403, "삭제 권한 없음")
+
+    db.delete(comment)
+
+    db.commit()
+
+    return {
+        "message": "댓글 삭제 완료"
+    }
